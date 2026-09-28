@@ -1,0 +1,13 @@
+data/
+runs/
+models/*.pt
+registry/*.json
+.venv/
+__pycache__/
+.vscode/
+*.pyc
+models/*.pth
+models/*.bin
+
+
+
