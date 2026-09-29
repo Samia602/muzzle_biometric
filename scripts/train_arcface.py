@@ -327,7 +327,8 @@ def main():
         exist_ok=True
     )
 
-    device = torch.device("cpu")
+    # ✅ FAST: Uses CUDA GPU if available, falls back to CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("\n================================")
     print("ArcFace Training")
