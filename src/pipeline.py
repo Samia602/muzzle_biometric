@@ -1,61 +1,213 @@
 import hashlib
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
-from torchvision import transforms as T
+from torchvision import transforms
+from ultralytics import YOLO
 
-from config import YOLO_WEIGHTS, ARC_WEIGHTS
 from src.models import EmbeddingNet
-from src.dataset import MEAN, STD
+def embedding_hash(embedding):
+    embedding_bytes = (
+        embedding.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+        .tobytes()
+    )
 
-
-def embedding_hash(emb: np.ndarray) -> str:
-    """SHA-256 of the int8-quantised embedding (this is what you anchor on-chain).
-    NOTE: exact-hash equality is NOT used for matching; matching = cosine similarity."""
-    q = np.round(np.asarray(emb) * 127).astype(np.int8).tobytes()
-    return hashlib.sha256(q).hexdigest()
-
+    return hashlib.sha256(
+        embedding_bytes
+    ).hexdigest()
 
 class MuzzlePipeline:
-    def __init__(self, yolo_weights=YOLO_WEIGHTS, arc_weights=ARC_WEIGHTS, device=None):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.detector = None
-        if yolo_weights and yolo_weights.exists():
-            from ultralytics import YOLO
-            self.detector = YOLO(str(yolo_weights))
-        ck = torch.load(arc_weights, map_location=self.device)
-        self.threshold = float(ck.get("threshold", 0.5))
-        self.size = ck["img_size"]
-        self.net = EmbeddingNet(ck["arch"], ck["emb_dim"], pretrained=False)
-        self.net.load_state_dict(ck["model"])
-        self.net.to(self.device).eval()
-        self.tf = T.Compose([T.Resize((self.size, self.size)), T.ToTensor(), T.Normalize(MEAN, STD)])
 
-    def detect(self, img: Image.Image, conf=0.25, margin=0.08):
-        """Returns (crop, box_xyxy or None, det_conf). Falls back to full image."""
-        if self.detector is None:
-            return img, None, 0.0
-        r = self.detector.predict(img, conf=conf, verbose=False)[0]
-        if len(r.boxes) == 0:
-            return img, None, 0.0
-        i = int(r.boxes.conf.argmax())
-        x1, y1, x2, y2 = r.boxes.xyxy[i].tolist()
-        w, h = x2 - x1, y2 - y1
-        W, H = img.size
-        box = (max(0, x1 - margin * w), max(0, y1 - margin * h), min(W, x2 + margin * w), min(H, y2 + margin * h))
-        return img.crop(tuple(int(v) for v in box)), box, float(r.boxes.conf[i])
+    def __init__(
+        self,
+        yolo_path="models/yolo_muzzle.pt",
+        arcface_path="models/arcface_muzzle.pt",
+        threshold=0.278
+    ):
 
-    @torch.no_grad()
-    def embed(self, crop: Image.Image) -> np.ndarray:
-        x = self.tf(crop.convert("RGB")).unsqueeze(0).to(self.device)
-        return self.net(x)[0].cpu().numpy()
+        self.device = "cpu"
+        self.threshold = threshold
 
-    def process(self, img: Image.Image, use_detector=True):
-        img = img.convert("RGB")
-        crop, box, conf = self.detect(img) if use_detector else (img, None, 0.0)
-        emb = self.embed(crop)
-        return {"crop": crop, "box": box, "det_conf": conf, "embedding": emb, "hash": embedding_hash(emb)}
+        # YOLO muzzle detector
+        self.yolo = YOLO(yolo_path)
+        self.detector = self.yolo
 
-    @staticmethod
-    def cosine(a, b) -> float:
-        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+        # ArcFace / ResNet18 embedding model
+        checkpoint = torch.load(
+            arcface_path,
+            map_location="cpu"
+        )
+
+        self.embedding_model = EmbeddingNet(
+            embedding_dim=512
+        )
+
+        self.embedding_model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        self.embedding_model.eval()
+
+        # Image preprocessing
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+
+            transforms.ToTensor(),
+
+            transforms.Normalize(
+                mean=[
+                    0.485,
+                    0.456,
+                    0.406
+                ],
+                std=[
+                    0.229,
+                    0.224,
+                    0.225
+                ]
+            )
+        ])
+
+    # ---------------------------------------------------------
+    # MUZZLE DETECTION
+    # ---------------------------------------------------------
+
+    def detect_muzzle(self, image):
+
+        results = self.yolo.predict(
+            source=image,
+            device="cpu",
+            imgsz=416,
+            conf=0.25,
+            verbose=False
+        )
+
+        result = results[0]
+
+        if result.boxes is None:
+            return None
+
+        if len(result.boxes) == 0:
+            return None
+
+        confidences = (
+            result.boxes.conf
+            .cpu()
+            .numpy()
+        )
+
+        best_index = int(
+            np.argmax(confidences)
+        )
+
+        box = (
+            result.boxes.xyxy[best_index]
+            .cpu()
+            .numpy()
+            .astype(int)
+        )
+
+        x1, y1, x2, y2 = box
+
+        image_array = np.array(image)
+
+        h, w = image_array.shape[:2]
+
+        x1 = max(0, min(x1, w - 1))
+        x2 = max(0, min(x2, w))
+        y1 = max(0, min(y1, h - 1))
+        y2 = max(0, min(y2, h))
+
+        crop = image_array[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return None
+
+        return (
+            Image.fromarray(crop),
+            box,
+            float(confidences[best_index])
+        )
+
+    # ---------------------------------------------------------
+    # EMBEDDING
+    # ---------------------------------------------------------
+
+    def embed(self, image):
+
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(image)
+
+        image = image.convert("RGB")
+
+        tensor = self.transform(image).unsqueeze(0)
+
+        with torch.no_grad():
+            embedding = self.embedding_model(tensor)
+
+        return embedding[0].cpu()
+
+    # ---------------------------------------------------------
+    # COMPLETE PIPELINE
+    # ---------------------------------------------------------
+
+    def process(self, image, use_detector=True):
+
+        image = image.convert("RGB")
+
+        box = None
+        crop = image
+        det_conf = 0.0
+
+        if use_detector:
+
+            detection = self.detect_muzzle(image)
+
+            if detection is not None:
+
+                crop, box, det_conf = detection
+
+        embedding = self.embed(crop)
+
+        # SHA-256 hash of embedding
+        biometric_hash = embedding_hash(embedding)
+
+        return {
+            "embedding": embedding,
+            "box": box,
+            "crop": crop,
+            "det_conf": det_conf,
+            "hash": biometric_hash
+        }
+
+    # ---------------------------------------------------------
+    # COSINE SIMILARITY
+    # ---------------------------------------------------------
+
+    def cosine(self, embedding1, embedding2):
+
+        return F.cosine_similarity(
+            embedding1.unsqueeze(0),
+            embedding2.unsqueeze(0)
+        ).item()
+
+    # ---------------------------------------------------------
+    # COMPARE
+    # ---------------------------------------------------------
+
+    def compare(self, embedding1, embedding2):
+
+        score = self.cosine(
+            embedding1,
+            embedding2
+        )
+
+        same = score >= self.threshold
+
+        return same, score
+

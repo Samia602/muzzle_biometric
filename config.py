@@ -82,3 +82,9 @@ RANDOM_SEED = 42
 # Cosine similarity threshold will eventually be tuned
 # automatically using validation data.
 DEFAULT_SIMILARITY_THRESHOLD = 0.50
+
+# ============================================================
+# REGISTRY
+# ============================================================
+
+REGISTRY_FILE = ROOT_DIR / "data" / "registry.json"

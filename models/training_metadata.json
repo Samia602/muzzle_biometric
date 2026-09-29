@@ -1,0 +1,16 @@
+{
+    "architecture": "ResNet18",
+    "embedding_dimension": 512,
+    "device": "cpu",
+    "epochs": 40,
+    "batch_size": 16,
+    "learning_rate": 0.0003,
+    "train_identities": 187,
+    "train_images": 3529,
+    "val_identities": 40,
+    "val_images": 720,
+    "final_train_loss": 0.00017842736878857486,
+    "final_train_accuracy": 1.0,
+    "best_val_loss": 0.0,
+    "checkpoint": "C:\\muzzle_biometric\\models\\arcface_muzzle.pt"
+}
