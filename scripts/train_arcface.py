@@ -1,539 +1,327 @@
-import argparse
-import json
-import random
 from pathlib import Path
+import json
+import sys
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from PIL import Image
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.models import EmbeddingNet, ArcFaceHead
 
+# ============================================================
+# PATHS
+# ============================================================
 
-IMAGE_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".webp",
-}
+# Auto-detect root directory (works locally on Windows/Linux or Google Colab)
+if Path("/content").exists():
+    ROOT = Path("/content/muzzle_biometric")
+else:
+    ROOT = Path(r"C:\muzzle_biometric")
 
+TRAIN_DIR = ROOT / "data" / "arcface" / "train"
+VAL_DIR = ROOT / "data" / "arcface" / "val"
+TEST_DIR = ROOT / "data" / "arcface" / "test"
+MODEL_DIR = ROOT / "models"
+
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# IMAGE TYPES
+# ============================================================
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# ============================================================
+# DATASET
+# ============================================================
 
 class CowDataset(Dataset):
-
-    def __init__(
-        self,
-        root,
-        transform=None,
-        class_to_idx=None
-    ):
-
+    def __init__(self, root, transform=None, class_to_idx=None):
         self.root = Path(root)
-
         self.transform = transform
 
-        folders = [
-            p for p in self.root.iterdir()
-            if p.is_dir()
-        ]
+        if not self.root.exists():
+            raise FileNotFoundError(
+                f"\nDataset folder not found:\n{self.root}"
+            )
 
-        folders.sort(
-            key=lambda x: x.name
-        )
+        folders = [f for f in self.root.iterdir() if f.is_dir()]
+        folders.sort(key=lambda x: x.name)
 
-        if class_to_idx is None:
-
+        # Map classes (reuse training mapping for validation to ensure consistency)
+        if class_to_idx is not None:
+            self.class_to_idx = class_to_idx
+        else:
             self.class_to_idx = {
-                folder.name: i
-                for i, folder in enumerate(folders)
+                folder.name: index for index, folder in enumerate(folders)
             }
 
-        else:
-
-            self.class_to_idx = class_to_idx
-
         self.samples = []
-
         for folder in folders:
-
-            if folder.name not in self.class_to_idx:
-                continue
-
-            label = self.class_to_idx[
-                folder.name
-            ]
-
-            for image in folder.iterdir():
-
-                if (
-                    image.is_file()
-                    and image.suffix.lower()
-                    in IMAGE_EXTENSIONS
-                ):
-
-                    self.samples.append(
-                        (
-                            image,
-                            label
-                        )
-                    )
+            if folder.name in self.class_to_idx:
+                label = self.class_to_idx[folder.name]
+                for image in folder.iterdir():
+                    if image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS:
+                        self.samples.append((image, label))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, index):
-
         image_path, label = self.samples[index]
-
-        image = Image.open(
-            image_path
-        ).convert("RGB")
+        image = Image.open(image_path).convert("RGB")
 
         if self.transform:
             image = self.transform(image)
 
         return image, label
 
+# ============================================================
+# TRANSFORMS
+# ============================================================
 
-def create_transforms():
-
-    train_transform = transforms.Compose([
-        transforms.Resize(
-            (224, 224)
-        ),
-
-        transforms.RandomRotation(
-            8
-        ),
-
+def create_train_transform():
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomRotation(8),
         transforms.ColorJitter(
-            brightness=0.15,
-            contrast=0.15,
-            saturation=0.10
+            brightness=0.15, contrast=0.15, saturation=0.10
         ),
-
         transforms.ToTensor(),
-
         transforms.Normalize(
-            mean=[
-                0.485,
-                0.456,
-                0.406
-            ],
-            std=[
-                0.229,
-                0.224,
-                0.225
-            ]
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
         )
     ])
 
-    eval_transform = transforms.Compose([
-        transforms.Resize(
-            (224, 224)
-        ),
-
+def create_val_transform():
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
-
         transforms.Normalize(
-            mean=[
-                0.485,
-                0.456,
-                0.406
-            ],
-            std=[
-                0.229,
-                0.224,
-                0.225
-            ]
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
         )
     ])
 
-    return train_transform, eval_transform
+# ============================================================
+# COUNT SPLIT
+# ============================================================
 
+def get_split_info(directory):
+    if not directory.exists():
+        return 0, 0
+    identities = [f for f in directory.iterdir() if f.is_dir()]
+    image_count = sum(
+        1 for id_dir in identities for img in id_dir.iterdir()
+        if img.is_file() and img.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    return len(identities), image_count
 
-def train_epoch(
-    backbone,
-    head,
-    loader,
-    optimizer,
-    device
-):
+# ============================================================
+# TRAIN & EVALUATE FUNCTIONS
+# ============================================================
 
-    backbone.train()
+def train_epoch(model, head, loader, optimizer, criterion, device):
+    model.train()
     head.train()
-
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    criterion = nn.CrossEntropyLoss()
+    total_loss, correct, total = 0.0, 0, 0
 
     for images, labels in loader:
-
-        images = images.to(device)
-        labels = labels.to(device)
+        images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
-
-        embeddings = backbone(images)
-
-        logits = head(
-            embeddings,
-            labels
-        )
-
-        loss = criterion(
-            logits,
-            labels
-        )
+        embeddings = model(images)
+        logits = head(embeddings, labels)
+        loss = criterion(logits, labels)
 
         loss.backward()
-
         optimizer.step()
 
-        total_loss += (
-            loss.item()
-            * images.size(0)
-        )
-
-        predictions = logits.argmax(
-            dim=1
-        )
-
-        correct += (
-            predictions == labels
-        ).sum().item()
-
+        total_loss += loss.item() * images.size(0)
+        predictions = logits.argmax(dim=1)
+        correct += (predictions == labels).sum().item()
         total += images.size(0)
 
-    return (
-        total_loss / total,
-        correct / total
-    )
+    return total_loss / total, correct / total
 
 
-def evaluate_classification(
-    backbone,
-    head,
-    loader,
-    device
-):
-
-    backbone.eval()
+@torch.no_grad()
+def validate_epoch(model, head, loader, criterion, device):
+    model.eval()
     head.eval()
+    total_loss, correct, total = 0.0, 0, 0
 
-    criterion = nn.CrossEntropyLoss()
+    for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
 
-    total_loss = 0.0
-    correct = 0
-    total = 0
+        embeddings = model(images)
+        logits = head(embeddings, labels)
+        loss = criterion(logits, labels)
 
-    with torch.no_grad():
+        total_loss += loss.item() * images.size(0)
+        predictions = logits.argmax(dim=1)
+        correct += (predictions == labels).sum().item()
+        total += images.size(0)
 
-        for images, labels in loader:
+    return (total_loss / total, correct / total) if total > 0 else (0.0, 0.0)
 
-            images = images.to(device)
-            labels = labels.to(device)
-
-            embeddings = backbone(images)
-
-            logits = head(
-                embeddings,
-                labels
-            )
-
-            loss = criterion(
-                logits,
-                labels
-            )
-
-            total_loss += (
-                loss.item()
-                * images.size(0)
-            )
-
-            predictions = logits.argmax(
-                dim=1
-            )
-
-            correct += (
-                predictions == labels
-            ).sum().item()
-
-            total += images.size(0)
-
-    return (
-        total_loss / total,
-        correct / total
-    )
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+    print("\n" + "=" * 50)
+    print("ArcFace Cow Muzzle Training")
+    print("=" * 50)
 
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=40
-    )
-
-    parser.add_argument(
-        "--batch",
-        type=int,
-        default=16
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=0.0003
-    )
-
-    args = parser.parse_args()
-
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-
-    root = Path(__file__).resolve().parents[1]
-
-    train_dir = (
-        root
-        / "data"
-        / "arcface"
-        / "train"
-    )
-
-    val_dir = (
-        root
-        / "data"
-        / "arcface"
-        / "val"
-    )
-
-    model_dir = (
-        root
-        / "models"
-    )
-
-    model_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # ✅ FAST: Uses CUDA GPU if available, falls back to CPU
+    # Device configuration (Uses CUDA/GPU in Colab, falls back to CPU locally)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nUsing Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU Model: {torch.cuda.get_device_name(0)}")
 
-    print("\n================================")
-    print("ArcFace Training")
-    print("================================")
+    # Check directories
+    print("\nChecking dataset directories...")
+    for directory in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
+        if not directory.exists():
+            print(f"Warning: Directory missing - {directory}")
+        else:
+            print(f"Found: {directory}")
 
-    print("Device:", device)
-    print("Architecture: ResNet18")
-    print("Embedding: 512")
-    print("Batch:", args.batch)
-    print("Epochs:", args.epochs)
+    # Dataset stats
+    train_classes, train_images = get_split_info(TRAIN_DIR)
+    val_classes, val_images = get_split_info(VAL_DIR)
+    test_classes, test_images = get_split_info(TEST_DIR)
 
-    train_transform, eval_transform = (
-        create_transforms()
-    )
+    print("\nDataset Summary:")
+    print(f"Train:      {train_classes} identities, {train_images} images")
+    print(f"Validation: {val_classes} identities, {val_images} images")
+    print(f"Test:       {test_classes} identities, {test_images} images")
 
-    train_dataset = CowDataset(
-        train_dir,
-        transform=train_transform
-    )
+    # Datasets & Loaders
+    train_transform = create_train_transform()
+    val_transform = create_val_transform()
 
-    class_to_idx = (
-        train_dataset.class_to_idx
-    )
-
-    # Validation only uses identities that
-    # exist in training for classification evaluation.
-    #
-    # The separate verification stage will evaluate
-    # unseen identities.
+    train_dataset = CowDataset(TRAIN_DIR, transform=train_transform)
     val_dataset = CowDataset(
-        val_dir,
-        transform=eval_transform,
-        class_to_idx=class_to_idx
+        VAL_DIR, transform=val_transform, class_to_idx=train_dataset.class_to_idx
     )
 
-    print(
-        "Training images:",
-        len(train_dataset)
-    )
-
-    print(
-        "Training classes:",
-        len(class_to_idx)
-    )
-
-    print(
-        "Validation images:",
-        len(val_dataset)
-    )
-
-    if len(train_dataset) == 0:
-        raise RuntimeError(
-            "No training images found."
-        )
+    batch_size = 32 if device.type == "cuda" else 16
+    num_workers = 2 if device.type == "cuda" else 0
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch,
-        shuffle=True,
-        num_workers=0
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
     )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch,
-        shuffle=False,
-        num_workers=0
-    )
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+    ) if len(val_dataset) > 0 else None
 
-    backbone = EmbeddingNet(
-        embedding_dim=512
-    ).to(device)
-
+    # Model & Head setup
+    embedding_dim = 512
+    model = EmbeddingNet(embedding_dim=embedding_dim).to(device)
     head = ArcFaceHead(
-        embedding_dim=512,
-        num_classes=len(class_to_idx),
+        embedding_dim=embedding_dim,
+        num_classes=len(train_dataset.class_to_idx),
         scale=30.0,
         margin=0.5
     ).to(device)
 
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(
-        list(backbone.parameters())
-        +
-        list(head.parameters()),
-        lr=args.lr,
+        list(model.parameters()) + list(head.parameters()),
+        lr=0.0003,
         weight_decay=0.0001
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs
-    )
+    epochs = 40
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
+    # Training Loop
+    history = []
     best_val_loss = float("inf")
+    checkpoint_path = MODEL_DIR / "arcface_muzzle.pt"
 
-    checkpoint_path = (
-        model_dir
-        / "arcface_muzzle.pt"
-    )
-
-    for epoch in range(
-        1,
-        args.epochs + 1
-    ):
-
-        train_loss, train_acc = (
-            train_epoch(
-                backbone,
-                head,
-                train_loader,
-                optimizer,
-                device
-            )
+    for epoch in range(epochs):
+        train_loss, train_acc = train_epoch(
+            model, head, train_loader, optimizer, criterion, device
         )
 
-        val_loss, val_acc = (
-            evaluate_classification(
-                backbone,
-                head,
-                val_loader,
-                device
+        if val_loader:
+            val_loss, val_acc = validate_epoch(
+                model, head, val_loader, criterion, device
             )
-            if len(val_dataset) > 0
-            else (0.0, 0.0)
-        )
+        else:
+            val_loss, val_acc = 0.0, 0.0
 
         scheduler.step()
 
         print(
-            f"\nEpoch {epoch}/{args.epochs}"
+            f"Epoch {epoch + 1:02d}/{epochs} | "
+            f"Train Loss: {train_loss:.4f} - Train Acc: {train_acc * 100:.2f}% | "
+            f"Val Loss: {val_loss:.4f} - Val Acc: {val_acc * 100:.2f}%"
         )
 
-        print(
-            f"Train loss: {train_loss:.4f}"
-        )
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_accuracy": train_acc,
+            "val_loss": val_loss,
+            "val_accuracy": val_acc
+        })
 
-        print(
-            f"Train accuracy: "
-            f"{train_acc * 100:.2f}%"
-        )
-
-        print(
-            f"Val loss: {val_loss:.4f}"
-        )
-
-        print(
-            f"Val accuracy: "
-            f"{val_acc * 100:.2f}%"
-        )
-
-        if val_loss < best_val_loss:
-
-            best_val_loss = val_loss
-
+        # Save checkpoint (Save best if validation exists, otherwise save latest)
+        is_best = val_loader and (val_loss < best_val_loss)
+        if is_best or not val_loader:
+            if is_best:
+                best_val_loss = val_loss
             checkpoint = {
-                "backbone": backbone.state_dict(),
-                "head": head.state_dict(),
-                "class_to_idx": class_to_idx,
-                "embedding_dim": 512,
-                "architecture": "resnet18",
-                "epoch": epoch,
+                "epoch": epoch + 1,
+                "embedding_dim": embedding_dim,
+                "num_classes": len(train_dataset.class_to_idx),
+                "class_to_idx": train_dataset.class_to_idx,
+                "model_state_dict": model.state_dict(),
+                "head_state_dict": head.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "train_loss": train_loss,
+                "train_accuracy": train_acc,
                 "val_loss": val_loss,
                 "val_accuracy": val_acc,
+                "history": history
             }
+            torch.save(checkpoint, checkpoint_path)
 
-            torch.save(
-                checkpoint,
-                checkpoint_path
-            )
-
-            print(
-                "Saved best checkpoint."
-            )
-
-    print("\n================================")
-    print("Training finished.")
-    print("================================")
-
-    print(
-        "Checkpoint:",
-        checkpoint_path
-    )
-
-    metadata_path = (
-        model_dir
-        / "arcface_metadata.json"
-    )
-
+    # Save Metadata JSON
     metadata = {
-        "architecture": "resnet18",
-        "embedding_dim": 512,
-        "num_classes": len(class_to_idx),
-        "checkpoint": str(
-            checkpoint_path
-        ),
+        "architecture": "ResNet18",
+        "embedding_dimension": embedding_dim,
+        "device": str(device),
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": 0.0003,
+        "train_identities": train_classes,
+        "train_images": train_images,
+        "val_identities": val_classes,
+        "val_images": val_images,
+        "final_train_loss": train_loss,
+        "final_train_accuracy": train_acc,
+        "best_val_loss": best_val_loss if val_loader else 0.0,
+        "checkpoint": str(checkpoint_path)
     }
 
-    metadata_path.write_text(
-        json.dumps(
-            metadata,
-            indent=4
-        ),
-        encoding="utf-8"
-    )
+    with open(MODEL_DIR / "training_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=4)
 
+    print("\n" + "=" * 50)
+    print("TRAINING COMPLETE")
+    print(f"Model saved to: {checkpoint_path}")
+    print("=" * 50)
 
 if __name__ == "__main__":
     main()

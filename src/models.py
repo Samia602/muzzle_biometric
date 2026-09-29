@@ -1,15 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet18, ResNet18_Weights
+
+from torchvision.models import (
+    resnet18,
+    ResNet18_Weights
+)
 
 
 class EmbeddingNet(nn.Module):
 
-    def __init__(
-        self,
-        embedding_dim=512
-    ):
+    def __init__(self, embedding_dim=512):
+
         super().__init__()
 
         backbone = resnet18(
@@ -51,6 +53,7 @@ class ArcFaceHead(nn.Module):
         scale=30.0,
         margin=0.5
     ):
+
         super().__init__()
 
         self.weight = nn.Parameter(
@@ -114,8 +117,7 @@ class ArcFaceHead(nn.Module):
 
         output = (
             cosine * (1.0 - one_hot)
-            +
-            target_cosine * one_hot
+            + target_cosine * one_hot
         )
 
         output *= self.scale
